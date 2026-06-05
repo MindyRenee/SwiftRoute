@@ -357,3 +357,88 @@ class TestStripeSetupWebhook:
 
         settings.payment_mode = "mock"
         settings.stripe_secret_key = ""
+
+
+class TestAiTxt:
+    def test_ai_txt(self, client: TestClient) -> None:
+        r = client.get("/ai.txt")
+        assert r.status_code == 200
+        text = r.text
+        assert "SubGrid Automaton Protocol" in text
+        assert "Endpoints" in text
+        assert "Pricing Model" in text
+        assert "Rate limit: 60" in text
+
+
+class TestCheckoutCreate:
+    def test_checkout_not_configured(self, client: TestClient) -> None:
+        r = client.post(
+            "/checkout/create",
+            json={
+                "amount_usd": 5.0,
+                "success_url": "https://example.com/success",
+                "cancel_url": "https://example.com/cancel",
+                "script_b64": "cHJpbnQoJ2hlbGxvJyk=",
+            },
+        )
+        assert r.status_code == 503
+        assert "not configured" in r.json()["detail"]
+
+    def test_checkout_invalid_script(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        from src.config import settings
+        settings.payment_mode = "stripe"
+        settings.stripe_secret_key = "sk_test_123"
+
+        r = client.post(
+            "/checkout/create",
+            json={
+                "amount_usd": 5.0,
+                "success_url": "https://example.com/success",
+                "cancel_url": "https://example.com/cancel",
+                "script_b64": "aW1wb3J0IG9zOyBvcy5zeXN0ZW0oJ3JtIC1yZiAvJyk=",  # dangerous script
+            },
+        )
+        assert r.status_code == 400
+        assert "forbidden" in r.json()["detail"].lower()
+
+        settings.payment_mode = "mock"
+        settings.stripe_secret_key = ""
+
+
+class TestConnectPayout:
+    def test_connect_payout_below_balance(self, client: TestClient) -> None:
+        r = client.post(
+            "/connect/payout",
+            json={"stripe_account_id": "acct_test_123", "amount_usd": 999.0},
+        )
+        assert r.status_code == 402
+        assert "below requested" in r.json()["detail"]
+
+    def test_connect_payout_zero_amount(self, client: TestClient) -> None:
+        r = client.post(
+            "/connect/payout",
+            json={"stripe_account_id": "acct_test_123", "amount_usd": 0.0},
+        )
+        assert r.status_code == 400
+        assert "Amount must be greater than 0" in r.json()["detail"]
+
+    def test_connect_payout_success(self, client: TestClient) -> None:
+        # Buy tickets first to generate creator balance
+        script = base64.b64encode(b"print('hello')").decode()
+        for _ in range(3):
+            client.post(
+                "/ticket",
+                json={
+                    "action": "buy_subgrid_compute_ticket",
+                    "execution_script_b64": script,
+                    "max_budget_usd": 5.0,
+                },
+            )
+        r = client.post(
+            "/connect/payout",
+            json={"stripe_account_id": "acct_test_123", "amount_usd": 0.05},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "initiated"
+        assert data["destination"] == "acct_test_123"

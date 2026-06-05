@@ -105,6 +105,23 @@ class StripeWebhookSetup(BaseModel):
     connect: bool = Field(False, description="Receive events from connected accounts")
 
 
+class CheckoutSessionRequest(BaseModel):
+    """Request to create a Stripe Checkout Session for a human buyer."""
+
+    amount_usd: float = Field(..., gt=0, description="Amount to charge in USD")
+    customer_email: str | None = Field(None, description="Pre-fill customer email")
+    success_url: str = Field(..., description="URL to redirect after successful payment")
+    cancel_url: str = Field(..., description="URL to redirect if user cancels")
+    script_b64: str = Field(..., description="Base64-encoded script to execute after payment")
+
+
+class ConnectPayoutRequest(BaseModel):
+    """Request a Stripe Connect payout to a connected account."""
+
+    stripe_account_id: str = Field(..., description="Connected account ID (acct_...)")
+    amount_usd: float | None = Field(None, description="Amount to transfer; defaults to full balance")
+
+
 # Global managers (initialized in lifespan)
 vm_mgr: MicroVMManager | None = None
 tunnel_mgr: WireGuardTunnelManager | None = None
@@ -215,6 +232,34 @@ async def llms_full_txt() -> str:
         "- pricing: Full delta-net breakdown.\n"
         "- receipt: Signed GHG Scope 3 compliance receipt.\n"
         "- vm_logs: Verified execution logs from Firecracker MicroVM.\n"
+    )
+
+
+@app.get("/ai.txt")
+async def ai_txt() -> str:
+    """ai.txt standard — machine-readable API info for AI agents and crawlers."""
+    return (
+        "# AI Agent Access Protocol (AAP) for SAP\n\n"
+        "## Contact\n"
+        "- Name: SubGrid Automaton Protocol\n"
+        "- URL: https://swiftroute-sap.onrender.com\n"
+        "- Docs: https://swiftroute-sap.onrender.com/docs\n\n"
+        "## Authentication\n"
+        "- Type: None (public gateway)\n"
+        "- Rate limit: 60 requests/minute per IP\n\n"
+        "## Endpoints\n"
+        "- GET /tunnel_route_and_price — live route and pricing\n"
+        "- POST /ticket — buy compute ticket\n"
+        "- POST /payment/intent — create Stripe PaymentIntent\n"
+        "- POST /webhook/stripe — Stripe webhook receiver\n\n"
+        "## Pricing Model\n"
+        "- Base: local compute cost + creator fee\n"
+        "- Fee: 4% transaction + $0.05 signature mint\n"
+        "- Currency: USD\n\n"
+        "## Execution Model\n"
+        "- Runtime: Firecracker MicroVM (isolated)\n"
+        "- Tunnel: WireGuard (kernel-level)\n"
+        "- Auto-destruct: VM destroyed after execution\n"
     )
 
 
@@ -563,17 +608,109 @@ async def creator_balance() -> dict[str, Any]:
     }
 
 
+@app.post("/checkout/create")
+async def create_checkout_session(req: CheckoutSessionRequest) -> dict[str, Any]:
+    """Create a Stripe Checkout Session for human buyers (hosted payment page)."""
+    if settings.payment_mode != "stripe" or not settings.stripe_secret_key:
+        raise HTTPException(status_code=503, detail="Stripe checkout not configured")
+
+    try:
+        decoded = base64.b64decode(req.script_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64: {exc}") from exc
+
+    if len(decoded) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Script exceeds 10 MiB")
+
+    _validate_script(decoded)
+
+    try:
+        import stripe
+        stripe.api_key = settings.stripe_secret_key
+        params: dict[str, Any] = {
+            "mode": "payment",
+            "line_items": [{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": "SAP Compute Ticket", "description": "Secure compute on surplus energy"},
+                    "unit_amount": int(req.amount_usd * 100),
+                },
+                "quantity": 1,
+            }],
+            "success_url": req.success_url,
+            "cancel_url": req.cancel_url,
+            "metadata": {
+                "script_b64": req.script_b64,
+                "gateway": "SAP",
+            },
+        }
+        if req.customer_email:
+            params["customer_email"] = req.customer_email
+        session = stripe.checkout.Session.create(**params)
+        return {
+            "checkout_url": session.url,
+            "session_id": session.id,
+            "amount_usd": req.amount_usd,
+            "status": session.status,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
+
+
+@app.post("/connect/payout")
+async def connect_payout(req: ConnectPayoutRequest) -> dict[str, Any]:
+    """Transfer earnings to a Stripe Connect account."""
+    balance = payment_proc.creator_balance
+    amount = req.amount_usd if req.amount_usd is not None else balance
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+    if balance < amount:
+        raise HTTPException(status_code=402, detail=f"Balance {balance} below requested amount {amount}")
+
+    if settings.payment_mode != "stripe" or not settings.stripe_secret_key:
+        # Mock mode: just debit and return
+        if hasattr(payment_proc, "_creator_balance"):
+            payment_proc._creator_balance -= amount
+        return {
+            "payout_id": f"payout_{uuid.uuid4().hex[:12]}",
+            "amount_usd": amount,
+            "status": "initiated",
+            "method": "mock_transfer",
+            "destination": req.stripe_account_id,
+        }
+
+    try:
+        import stripe
+        stripe.api_key = settings.stripe_secret_key
+        transfer = stripe.Transfer.create(
+            amount=int(amount * 100),
+            currency="usd",
+            destination=req.stripe_account_id,
+            description="SAP creator payout",
+        )
+        if hasattr(payment_proc, "_creator_balance"):
+            payment_proc._creator_balance -= amount
+        return {
+            "payout_id": transfer.id,
+            "amount_usd": amount,
+            "status": "initiated",
+            "method": "stripe_connect_transfer",
+            "destination": req.stripe_account_id,
+            "transfer_reversed": False,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
+
+
 @app.post("/creator/payout")
 async def creator_payout() -> dict[str, Any]:
-    """Request a creator payout if balance meets threshold."""
+    """Request a creator payout if balance meets threshold (legacy endpoint)."""
     balance = payment_proc.creator_balance
     if balance < settings.payout_threshold_usd:
         raise HTTPException(
             status_code=402,
             detail=f"Balance {balance} below threshold {settings.payout_threshold_usd}",
         )
-    # In production this would trigger a Stripe Connect transfer.
-    # Here we debit the balance and return a payout receipt.
     payout_id = f"payout_{uuid.uuid4().hex[:12]}"
     if hasattr(payment_proc, "_creator_balance"):
         payment_proc._creator_balance = 0.0
