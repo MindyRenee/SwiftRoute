@@ -175,4 +175,3 @@ class MicroVMManager:
         """Emergency teardown of every managed MicroVM."""
         for vm in list(self._vms.values()):
             await self.destroy(vm)
-            await self.destroy(vm)

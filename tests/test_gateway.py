@@ -1,6 +1,7 @@
 """Tests for the SAP API gateway."""
 
 import base64
+import time
 from typing import Any
 
 import pytest
@@ -9,17 +10,27 @@ from fastapi.testclient import TestClient
 from src.gateway import app
 
 
+def _poll_job_status(client: TestClient, job_id: str, timeout: float = 3.0) -> dict[str, Any]:
+    """Poll /job/{job_id} until the job completes or times out."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = client.get(f"/job/{job_id}")
+        if r.status_code == 200:
+            data = r.json()
+            if data["status"] in ("completed", "failed"):
+                return data
+        time.sleep(0.05)
+    raise TimeoutError(f"Job {job_id} did not complete within {timeout}s")
+
+
 @pytest.fixture
-def client() -> TestClient:
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     from src.config import settings
-    old_mode = settings.payment_mode
-    old_key = settings.stripe_secret_key
-    settings.payment_mode = "mock"
-    settings.stripe_secret_key = ""
+    monkeypatch.setattr(settings, "payment_mode", "mock")
+    monkeypatch.setattr(settings, "stripe_secret_key", "")
+    monkeypatch.setattr(settings, "stripe_webhook_secret", "")
     with TestClient(app) as c:
         yield c
-    settings.payment_mode = old_mode
-    settings.stripe_secret_key = old_key
 
 
 class TestRootEndpoints:
@@ -31,7 +42,11 @@ class TestRootEndpoints:
     def test_health(self, client: TestClient) -> None:
         r = client.get("/health")
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
+        data = r.json()
+        assert data["status"] == "ok"
+        assert "checks" in data
+        for name in ("vm_manager", "tunnel_manager", "sge", "payment", "job_queue"):
+            assert name in data["checks"]
 
 
 class TestTunnelRouteAndPrice:
@@ -65,15 +80,20 @@ class TestTicketEndpoint:
         )
         assert r.status_code == 200
         data = r.json()
-        assert data["status"] == "completed"
+        assert data["status"] == "queued"
         assert data["job_id"]
         assert data["zone"]["id"]
         assert data["pricing"]["delta_net"]
-        assert data["receipt"]["signature"]
-        assert data["vm_logs"]["status"] == "completed"
-        assert data["payment"]["status"] == "captured"
+        assert data["payment"]["status"] == "authorized"
         assert data["payment"]["payment_id"]
         assert data["payment"]["amount_usd"] > 0
+
+        # Poll for completion
+        final = _poll_job_status(client, data["job_id"])
+        assert final["status"] == "completed"
+        assert final["receipt"]
+        assert final["vm_logs"]
+        assert final["payment"]["status"] == "captured"
 
     def test_buy_ticket_with_payment_method(self, client: TestClient) -> None:
         script = base64.b64encode(b"print('hello')").decode()
@@ -88,7 +108,7 @@ class TestTicketEndpoint:
         )
         assert r.status_code == 200
         data = r.json()
-        assert data["payment"]["status"] == "captured"
+        assert data["status"] == "queued"
 
     def test_invalid_base64(self, client: TestClient) -> None:
         r = client.post(
@@ -148,13 +168,30 @@ class TestTicketEndpoint:
             },
         )
         assert r.status_code == 400
-        assert "forbidden" in r.json()["detail"].lower()
+        assert "validation failed" in r.json()["detail"].lower()
+
+
+class TestJobStatusEndpoint:
+    def test_unknown_job(self, client: TestClient) -> None:
+        r = client.get("/job/does-not-exist")
+        assert r.status_code == 404
+        assert "Unknown job_id" in r.json()["detail"]
 
 
 class TestGridWebhook:
     def test_grid_webhook_peak(self, client: TestClient) -> None:
-        from src.gateway import _job_registry
+        from src.gateway import _job_registry, _job_queue
         _job_registry.add("job-abc")
+        # Inject a fake job so freeze/resume works
+        _job_queue._jobs["job-abc"] = type(
+            "FakeJob",
+            (),
+            {
+                "status": type("Status", (), {"value": "running"})(),
+                "freeze": lambda self: setattr(self, "status", type("Status", (), {"value": "frozen"})()),
+                "_freeze_event": type("E", (), {"clear": lambda self: None, "set": lambda self: None})(),
+            },
+        )()
         r = client.post(
             "/webhook/grid",
             json={
@@ -204,7 +241,7 @@ class TestGridWebhook:
 class TestCreatorEndpoints:
     def test_balance_after_ticket(self, client: TestClient) -> None:
         script = base64.b64encode(b"print('hello')").decode()
-        client.post(
+        r = client.post(
             "/ticket",
             json={
                 "action": "buy_subgrid_compute_ticket",
@@ -212,6 +249,10 @@ class TestCreatorEndpoints:
                 "max_budget_usd": 5.0,
             },
         )
+        assert r.status_code == 200
+        job_id = r.json()["job_id"]
+        _poll_job_status(client, job_id)
+
         r = client.get("/creator/balance")
         assert r.status_code == 200
         data = r.json()
@@ -223,14 +264,12 @@ class TestCreatorEndpoints:
         assert r.status_code == 402
         assert "below threshold" in r.json()["detail"]
 
-    def test_payout_after_multiple_tickets(self, client: TestClient) -> None:
+    def test_payout_after_multiple_tickets(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        old_threshold = settings.payout_threshold_usd
-        settings.payout_threshold_usd = 0.10  # low threshold for testing
+        monkeypatch.setattr(settings, "payout_threshold_usd", 0.10)
         script = base64.b64encode(b"print('hello')").decode()
-        # Run enough tickets to exceed lowered threshold
         for _ in range(5):
-            client.post(
+            r = client.post(
                 "/ticket",
                 json={
                     "action": "buy_subgrid_compute_ticket",
@@ -238,8 +277,9 @@ class TestCreatorEndpoints:
                     "max_budget_usd": 5.0,
                 },
             )
+            _poll_job_status(client, r.json()["job_id"])
+
         r = client.post("/creator/payout")
-        settings.payout_threshold_usd = old_threshold
         assert r.status_code == 200
         data = r.json()
         assert data["status"] == "initiated"

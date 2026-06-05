@@ -42,6 +42,17 @@ class Settings(BaseSettings):
     sge_peak_threshold_usd_per_mwh: float = 5000.0
     sge_pause_minutes: int = 15
 
+    # Receipt signing keys (paths to PEM files; generated on first run if missing)
+    receipt_private_key_path: str = "./data/receipt_private.pem"
+    receipt_public_key_path: str = "./data/receipt_public.pem"
+
+    # Persistence
+    db_path: str = "./data/sap.db"
+
+    # Job & rate-limit housekeeping
+    job_max_age_seconds: int = 86400  # 24 hours
+    rate_limit_max_entries: int = 10000
+
     # Payments
     payment_mode: str = "mock"  # "mock" | "stripe"
     stripe_secret_key: str = ""

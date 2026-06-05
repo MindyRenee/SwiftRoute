@@ -3,7 +3,6 @@
 import base64
 import json
 import logging
-import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -15,10 +14,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.config import settings
+from src.job_queue import Job, JobQueue
 from src.payments import get_processor
 from src.pricing import calculate_pricing
 from src.receipts import ReceiptGenerator
 from src.router import find_optimal_zone
+from src.script_validator import ScriptValidationError, validate_script
 from src.sge import GridEvent, SGEEventType, SyntheticGridElasticity
 from src.tunnel_manager import WireGuardTunnelManager
 from src.vm_manager import MicroVMManager
@@ -31,12 +32,21 @@ _rate_limit_store: dict[str, list[float]] = {}
 # Valid job IDs created by this gateway instance
 _job_registry: set[str] = set()
 
+# Background job queue
+_job_queue: JobQueue = JobQueue()
+
+# Stripe is an optional dependency; import once at module level with graceful fallback.
+try:
+    import stripe as _stripe_module
+except ImportError:
+    _stripe_module = None  # type: ignore[assignment]
+
 
 class RateLimitMiddleware:
-    """Basic in-memory rate-limiting middleware."""
+    """Basic in-memory rate-limiting middleware with bounded store."""
 
-    def __init__(self, app: FastAPI, max_requests: int = 60, window_seconds: int = 60) -> None:
-        self.app = app
+    def __init__(self, fastapi_app: FastAPI, max_requests: int = 60, window_seconds: int = 60) -> None:
+        self.app = fastapi_app
         self.max_requests = max_requests
         self.window_seconds = window_seconds
 
@@ -52,6 +62,13 @@ class RateLimitMiddleware:
         # Prune old entries
         while reqs and reqs[0] < now - window:
             reqs.pop(0)
+        # Enforce bounded store to prevent memory exhaustion
+        if len(_rate_limit_store) > settings.rate_limit_max_entries:
+            oldest_ip = min(
+                _rate_limit_store,
+                key=lambda k: _rate_limit_store[k][0] if _rate_limit_store[k] else now,
+            )
+            _rate_limit_store.pop(oldest_ip, None)
         if len(reqs) >= self.max_requests:
             response = JSONResponse(
                 status_code=429,
@@ -115,6 +132,18 @@ class CheckoutSessionRequest(BaseModel):
     script_b64: str = Field(..., description="Base64-encoded script to execute after payment")
 
 
+class JobStatusResponse(BaseModel):
+    """Job status lookup response."""
+
+    job_id: str
+    status: str
+    zone: dict[str, Any] | None = None
+    pricing: dict[str, Any] | None = None
+    receipt: dict[str, Any] | None = None
+    vm_logs: dict[str, Any] | None = None
+    payment: dict[str, Any] | None = None
+
+
 class ConnectPayoutRequest(BaseModel):
     """Request a Stripe Connect payout to a connected account."""
 
@@ -129,14 +158,24 @@ sge: SyntheticGridElasticity | None = None
 payment_proc = get_processor()
 
 
+def _prune_job_registry() -> None:
+    """Remove stale job IDs to prevent unbounded growth."""
+    max_jobs = settings.rate_limit_max_entries
+    if len(_job_registry) > max_jobs:
+        active = set(_job_queue._jobs.keys())
+        _job_registry.intersection_update(active)
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, None]:
     global vm_mgr, tunnel_mgr, sge, payment_proc
     vm_mgr = MicroVMManager()
     tunnel_mgr = WireGuardTunnelManager()
     sge = SyntheticGridElasticity()
     payment_proc = get_processor()
+    _job_queue.start_worker()
     yield
+    _job_queue.stop_worker()
     if vm_mgr:
         await vm_mgr.destroy_all()
     if tunnel_mgr:
@@ -264,27 +303,11 @@ async def ai_txt() -> str:
 
 
 def _validate_script(decoded: bytes) -> None:
-    """Reject scripts containing dangerous system-level patterns."""
+    """Reject scripts containing dangerous system-level patterns via AST whitelist."""
     try:
-        text = decoded.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Script is not valid UTF-8: {exc}") from exc
-
-    dangerous = [
-        r"\bos\.system\b",
-        r"\bsubprocess\b",
-        r"\beval\b",
-        r"\bexec\b",
-        r"\bcompile\b",
-        r"\b__import__\b",
-        r"\bimport\s+socket\b",
-        r"\bopen\s*\(",
-        r"\burllib\b",
-        r"\brequests\b",
-    ]
-    for pattern in dangerous:
-        if re.search(pattern, text, re.IGNORECASE):
-            raise HTTPException(status_code=400, detail=f"Script contains forbidden pattern: {pattern}")
+        validate_script(decoded)
+    except ScriptValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Script validation failed: {exc}") from exc
 
 
 @app.post("/ticket", response_model=TicketResponse)
@@ -325,48 +348,24 @@ async def buy_ticket(req: TicketRequest) -> TicketResponse:
     if payment.status == "failed":
         raise HTTPException(status_code=402, detail="Payment authorization failed")
 
-    # 5. Create secure tunnel
-    if tunnel_mgr is None:
-        raise HTTPException(status_code=503, detail="Tunnel manager not ready")
-    tunnel = tunnel_mgr.create_tunnel()
+    # 5. Enqueue job for async execution
+    job_id = str(uuid.uuid4())
+    _job_registry.add(job_id)
+    _prune_job_registry()
 
-    # 6. Spin up MicroVM and execute
-    if vm_mgr is None:
-        await payment_proc.refund(payment.payment_id, total_charge)
-        raise HTTPException(status_code=503, detail="VM manager not ready")
-    vm = await vm_mgr.create_vm(req.execution_script_b64)
-    _job_registry.add(vm.vm_id)
-    try:
-        logs = await vm_mgr.execute(vm)
-    except Exception:
-        await payment_proc.refund(payment.payment_id, total_charge)
-        _job_registry.discard(vm.vm_id)
-        raise HTTPException(status_code=500, detail="Execution failed; payment refunded")
-    finally:
-        await vm_mgr.destroy(vm)
-
-    # 7. Capture payment on success
-    captured = await payment_proc.capture(payment.payment_id, total_charge)
-
-    # 8. Mint tax receipt
-    receipt = ReceiptGenerator.generate(
-        job_id=vm.vm_id,
-        carbon_diverted_g=pricing.delta_net.carbon_g,
-        carbon_remote_g=remote_state.carbon_g,
-        carbon_local_g=pricing.v_local.carbon_g,
-        tax_credit_usd=pricing.delta_net.tax_value_usd,
+    job = Job(
+        job_id=job_id,
+        script_b64=req.execution_script_b64,
+        zone_id=zone.id,
         zone_name=zone.name,
-        zone_region=zone.region,
+        payment_id=payment.payment_id,
+        total_charge=total_charge,
     )
-
-    logger.info("Ticket completed: job_id=%s zone=%s amount_usd=%s", vm.vm_id, zone.name, total_charge)
-
-    # 9. Tear down tunnel
-    tunnel_mgr.tear_down(tunnel)
+    await _job_queue.enqueue(job)
 
     return TicketResponse(
-        job_id=vm.vm_id,
-        status="completed",
+        job_id=job_id,
+        status="queued",
         zone={
             "id": zone.id,
             "name": zone.name,
@@ -398,15 +397,31 @@ async def buy_ticket(req: TicketRequest) -> TicketResponse:
             "creator_yield_usd": pricing.creator_yield_usd,
             "client_net_value_usd": pricing.client_net_value_usd,
         },
-        receipt=json.loads(ReceiptGenerator.to_json(receipt)),
-        vm_logs=logs,
+        receipt={},
+        vm_logs={},
         payment={
-            "payment_id": captured.payment_id,
-            "status": captured.status,
-            "amount_usd": captured.amount_usd,
-            "fee_usd": captured.fee_usd,
-            "net_usd": captured.net_usd,
+            "payment_id": payment.payment_id,
+            "status": payment.status,
+            "amount_usd": payment.amount_usd,
+            "fee_usd": payment.fee_usd,
+            "net_usd": payment.net_usd,
         },
+    )
+
+
+@app.get("/job/{job_id}")
+async def get_job_status(job_id: str) -> JobStatusResponse:
+    """Look up the current status and results of a queued job."""
+    job = _job_queue.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        zone={"id": job.zone_id, "name": job.zone_name} if job.zone_id else None,
+        receipt=job.receipt if job.receipt else None,
+        vm_logs=job.vm_logs if job.vm_logs else None,
+        payment=job.payment_result if job.payment_result else None,
     )
 
 
@@ -430,7 +445,15 @@ async def grid_webhook(webhook: GridWebhook) -> dict[str, Any]:
         price_usd_per_mwh=webhook.price_usd_per_mwh,
         timestamp=webhook.timestamp,
     )
+
+    # Delegate to SGE engine for payout calculation, then freeze/resume via job queue
     result = await sge.process_event(event, webhook.job_id)
+
+    if result.get("action") == "frozen":
+        _job_queue.freeze_job(webhook.job_id)
+    elif result.get("action") == "resumed":
+        _job_queue.resume_job(webhook.job_id)
+
     logger.info("SGE event processed: job_id=%s action=%s", webhook.job_id, result.get("action"))
     return result
 
@@ -485,12 +508,13 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
     if settings.payment_mode != "stripe" or not settings.stripe_webhook_secret:
         raise HTTPException(status_code=503, detail="Stripe webhooks not configured")
 
-    import stripe
+    if _stripe_module is None:
+        raise HTTPException(status_code=503, detail="Stripe library not installed")
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
     try:
-        event = stripe.Webhook.construct_event(  # type: ignore[no-untyped-call]
+        event = _stripe_module.Webhook.construct_event(
             payload, sig_header, settings.stripe_webhook_secret
         )
     except Exception as exc:
@@ -505,8 +529,8 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         "charge.failed": _handle_charge_failed,
         "charge.refunded": _handle_charge_refunded,
         "charge.dispute.created": _handle_dispute_created,
-        "payment_intent.succeeded": lambda o: _handle_charge_succeeded(o),
-        "payment_intent.payment_failed": lambda o: _handle_charge_failed(o),
+        "payment_intent.succeeded": _handle_charge_succeeded,
+        "payment_intent.payment_failed": _handle_charge_failed,
         "payout.created": lambda o: _handle_payout_event("payout.created", o),
         "payout.paid": lambda o: _handle_payout_event("payout.paid", o),
         "payout.failed": lambda o: _handle_payout_event("payout.failed", o),
@@ -528,9 +552,11 @@ async def setup_stripe_webhook(req: StripeWebhookSetup) -> dict[str, Any]:
     if settings.payment_mode != "stripe" or not settings.stripe_secret_key:
         raise HTTPException(status_code=503, detail="Stripe not configured")
 
+    if _stripe_module is None:
+        raise HTTPException(status_code=503, detail="Stripe library not installed")
+
     try:
-        import stripe
-        stripe.api_key = settings.stripe_secret_key
+        _stripe_module.api_key = settings.stripe_secret_key
         params: dict[str, Any] = {
             "enabled_events": [
                 "charge.succeeded",
@@ -551,7 +577,7 @@ async def setup_stripe_webhook(req: StripeWebhookSetup) -> dict[str, Any]:
             params["description"] = req.description
         if req.connect:
             params["connect"] = True
-        endpoint = stripe.WebhookEndpoint.create(**params)
+        endpoint = _stripe_module.WebhookEndpoint.create(**params)
         return {
             "webhook_endpoint_id": endpoint.id,
             "secret": endpoint.secret,
@@ -569,14 +595,16 @@ async def create_payment_intent(request: dict[str, Any]) -> dict[str, Any]:
     if settings.payment_mode != "stripe" or not settings.stripe_secret_key:
         raise HTTPException(status_code=503, detail="Stripe payments not configured")
 
+    if _stripe_module is None:
+        raise HTTPException(status_code=503, detail="Stripe library not installed")
+
     amount = request.get("amount_usd", 0.0)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="amount_usd must be greater than 0")
 
     try:
-        import stripe
-        stripe.api_key = settings.stripe_secret_key
-        intent = stripe.PaymentIntent.create(
+        _stripe_module.api_key = settings.stripe_secret_key
+        intent = _stripe_module.PaymentIntent.create(
             amount=int(amount * 100),
             currency="usd",
             description="SAP compute ticket",
@@ -594,8 +622,35 @@ async def create_payment_intent(request: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    """Probe all critical dependencies and return granular status."""
+    checks: dict[str, Any] = {}
+    healthy = True
+
+    # VM manager
+    checks["vm_manager"] = "ready" if vm_mgr is not None else "not_ready"
+    healthy &= checks["vm_manager"] == "ready"
+
+    # Tunnel manager
+    checks["tunnel_manager"] = "ready" if tunnel_mgr is not None else "not_ready"
+    healthy &= checks["tunnel_manager"] == "ready"
+
+    # SGE engine
+    checks["sge"] = "ready" if sge is not None else "not_ready"
+    healthy &= checks["sge"] == "ready"
+
+    # Payment processor
+    checks["payment"] = "ready" if payment_proc is not None else "not_ready"
+    healthy &= checks["payment"] == "ready"
+
+    # Job queue worker
+    checks["job_queue"] = (
+        "running" if _job_queue._task and not _job_queue._task.done() else "not_running"
+    )
+    healthy &= checks["job_queue"] == "running"
+
+    status = "ok" if healthy else "degraded"
+    return {"status": status, "checks": checks}
 
 
 @app.get("/creator/balance")
@@ -614,6 +669,9 @@ async def create_checkout_session(req: CheckoutSessionRequest) -> dict[str, Any]
     if settings.payment_mode != "stripe" or not settings.stripe_secret_key:
         raise HTTPException(status_code=503, detail="Stripe checkout not configured")
 
+    if _stripe_module is None:
+        raise HTTPException(status_code=503, detail="Stripe library not installed")
+
     try:
         decoded = base64.b64decode(req.script_b64)
     except Exception as exc:
@@ -625,8 +683,10 @@ async def create_checkout_session(req: CheckoutSessionRequest) -> dict[str, Any]
     _validate_script(decoded)
 
     try:
-        import stripe
-        stripe.api_key = settings.stripe_secret_key
+        _stripe_module.api_key = settings.stripe_secret_key
+        # Store a one-way hash reference instead of raw script to avoid leaking code to Stripe
+        import hashlib
+        script_hash = hashlib.sha256(req.script_b64.encode()).hexdigest()[:16]
         params: dict[str, Any] = {
             "mode": "payment",
             "line_items": [{
@@ -640,13 +700,13 @@ async def create_checkout_session(req: CheckoutSessionRequest) -> dict[str, Any]
             "success_url": req.success_url,
             "cancel_url": req.cancel_url,
             "metadata": {
-                "script_b64": req.script_b64,
+                "script_ref": script_hash,
                 "gateway": "SAP",
             },
         }
         if req.customer_email:
             params["customer_email"] = req.customer_email
-        session = stripe.checkout.Session.create(**params)
+        session = _stripe_module.checkout.Session.create(**params)
         return {
             "checkout_url": session.url,
             "session_id": session.id,
@@ -668,9 +728,9 @@ async def connect_payout(req: ConnectPayoutRequest) -> dict[str, Any]:
         raise HTTPException(status_code=402, detail=f"Balance {balance} below requested amount {amount}")
 
     if settings.payment_mode != "stripe" or not settings.stripe_secret_key:
-        # Mock mode: just debit and return
-        if hasattr(payment_proc, "_creator_balance"):
-            payment_proc._creator_balance -= amount
+        # Mock mode: debit and return
+        payment_proc._creator_balance -= amount
+        payment_proc._save_balances()
         return {
             "payout_id": f"payout_{uuid.uuid4().hex[:12]}",
             "amount_usd": amount,
@@ -679,17 +739,18 @@ async def connect_payout(req: ConnectPayoutRequest) -> dict[str, Any]:
             "destination": req.stripe_account_id,
         }
 
+    if _stripe_module is None:
+        raise HTTPException(status_code=503, detail="Stripe library not installed")
+
     try:
-        import stripe
-        stripe.api_key = settings.stripe_secret_key
-        transfer = stripe.Transfer.create(
+        _stripe_module.api_key = settings.stripe_secret_key
+        transfer = _stripe_module.Transfer.create(
             amount=int(amount * 100),
             currency="usd",
             destination=req.stripe_account_id,
             description="SAP creator payout",
         )
-        if hasattr(payment_proc, "_creator_balance"):
-            payment_proc._creator_balance -= amount
+        payment_proc._save_balances()
         return {
             "payout_id": transfer.id,
             "amount_usd": amount,
@@ -712,8 +773,7 @@ async def creator_payout() -> dict[str, Any]:
             detail=f"Balance {balance} below threshold {settings.payout_threshold_usd}",
         )
     payout_id = f"payout_{uuid.uuid4().hex[:12]}"
-    if hasattr(payment_proc, "_creator_balance"):
-        payment_proc._creator_balance = 0.0
+    payment_proc._save_balances()
     return {
         "payout_id": payout_id,
         "amount_usd": balance,

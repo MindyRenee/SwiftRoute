@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from src.config import settings
+from src.persistence import Persistence
+
+_persistence = Persistence()
 
 
 @dataclass(frozen=True)
@@ -39,8 +42,15 @@ class MockPaymentProcessor:
 
     def __init__(self) -> None:
         self._ledger: dict[str, PaymentResult] = {}
-        self._creator_balance: float = 0.0
-        self._node_payout_usd: float = 0.0
+        self._load_balances()
+
+    def _load_balances(self) -> None:
+        stored = _persistence.get_balances()
+        self._creator_balance: float = stored["creator_balance"]
+        self._node_payout_usd: float = stored["node_payout_usd"]
+
+    def _save_balances(self) -> None:
+        _persistence.set_balances(self._creator_balance, self._node_payout_usd)
 
     @property
     def creator_balance(self) -> float:
@@ -84,6 +94,7 @@ class MockPaymentProcessor:
         self._ledger[payment_id] = captured
         self._creator_balance += fee + settings.signature_mint_fee_usd
         self._node_payout_usd += net
+        self._save_balances()
         return captured
 
     async def refund(self, payment_id: str, amount_usd: float) -> PaymentResult:
@@ -101,6 +112,7 @@ class MockPaymentProcessor:
         earned = fee + settings.signature_mint_fee_usd
         self._creator_balance = max(0.0, self._creator_balance - earned)
         self._node_payout_usd = max(0.0, self._node_payout_usd - (amount_usd - fee))
+        self._save_balances()
         result = PaymentResult(
             payment_id=payment_id,
             status="refunded",
@@ -117,8 +129,15 @@ class StripePaymentProcessor:
 
     def __init__(self, secret_key: str = settings.stripe_secret_key) -> None:
         self.secret_key = secret_key
-        self._creator_balance: float = 0.0
-        self._node_payout_usd: float = 0.0
+        self._load_balances()
+
+    def _load_balances(self) -> None:
+        stored = _persistence.get_balances()
+        self._creator_balance: float = stored["creator_balance"]
+        self._node_payout_usd: float = stored["node_payout_usd"]
+
+    def _save_balances(self) -> None:
+        _persistence.set_balances(self._creator_balance, self._node_payout_usd)
 
     @property
     def creator_balance(self) -> float:
@@ -163,10 +182,11 @@ class StripePaymentProcessor:
         try:
             import stripe
             stripe.api_key = self.secret_key
-            stripe.PaymentIntent.capture(payment_id)
+            stripe.PaymentIntent.capture(payment_id, amount=int(amount_usd * 100))
             fee = round(amount_usd * settings.transaction_fee_rate, 2)
             self._creator_balance += fee + settings.signature_mint_fee_usd
             self._node_payout_usd += amount_usd - fee
+            self._save_balances()
             return PaymentResult(
                 payment_id=payment_id,
                 status="captured",
@@ -192,6 +212,7 @@ class StripePaymentProcessor:
             earned = fee + settings.signature_mint_fee_usd
             self._creator_balance = max(0.0, self._creator_balance - earned)
             self._node_payout_usd = max(0.0, self._node_payout_usd - (amount_usd - fee))
+            self._save_balances()
             return PaymentResult(
                 payment_id=payment_id,
                 status="refunded",

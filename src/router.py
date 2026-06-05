@@ -9,6 +9,17 @@ from src.config import settings
 from src.pricing import StateVector
 
 
+# Persistent HTTP client (connection-pooled)
+_persistent_client: httpx.AsyncClient | None = None
+
+
+def get_persistent_client() -> httpx.AsyncClient:
+    global _persistent_client
+    if _persistent_client is None:
+        _persistent_client = httpx.AsyncClient(timeout=10.0)
+    return _persistent_client
+
+
 @dataclass(frozen=True)
 class Zone:
     """A surplus-energy compute zone."""
@@ -72,12 +83,12 @@ class StaticGridClient:
 
 
 class HttpGridClient:
-    """Production HTTP grid API client."""
+    """Production HTTP grid API client (uses persistent connection pool)."""
 
     def __init__(self, base_url: str = settings.grid_api_url, api_key: str = settings.grid_api_key):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self._client = httpx.AsyncClient(timeout=10.0)
+        self._client = get_persistent_client()
 
     async def fetch_zones(self) -> list[Zone]:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -88,9 +99,6 @@ class HttpGridClient:
             return [Zone(**z) for z in data.get("zones", [])]
         except (httpx.HTTPError, httpx.DecodingError) as exc:
             raise RouterError(f"Grid API unreachable: {exc}") from exc
-
-    async def close(self) -> None:
-        await self._client.aclose()
 
 
 class RouterError(Exception):
@@ -108,20 +116,31 @@ def _zone_to_state(zone: Zone, workload_kwh: float = 10.0) -> StateVector:
     )
 
 
+def _zone_score(zone: Zone, workload_kwh: float = 10.0) -> float:
+    """Multi-objective score: lower is better.
+
+    Combines compute cost, carbon impact, and tax credit value with
+    configurable weights. Current weighting prioritizes cost savings
+    (70%), carbon reduction (20%), and tax credits (10%).
+    """
+    state = _zone_to_state(zone, workload_kwh)
+    # Normalize against typical ranges to keep weights comparable
+    cost_score = state.compute_cost_usd / 10.0  # ~0-1 normalized
+    carbon_score = state.carbon_g / 5000.0  # ~0-1 normalized
+    tax_score = -state.tax_value_usd / 1.0  # negative because higher tax credits are better
+    return (cost_score * 0.7) + (carbon_score * 0.2) + (tax_score * 0.1)
+
+
 async def find_optimal_zone(
     workload_kwh: float = 10.0,
     client: GridClient | None = None,
 ) -> tuple[Zone, StateVector]:
-    """Locate the single most efficient, lowest-cost energy surplus zone."""
+    """Locate the single most efficient energy surplus zone using multi-objective scoring."""
     grid = client or (HttpGridClient() if settings.grid_api_key else StaticGridClient())
-    try:
-        zones = await grid.fetch_zones()
-    finally:
-        if isinstance(grid, HttpGridClient):
-            await grid.close()
+    zones = await grid.fetch_zones()
     if not zones:
         raise RouterError("No surplus zones available")
 
-    best_zone = min(zones, key=lambda z: z.compute_cost_usd_per_kwh)
+    best_zone = min(zones, key=lambda z: _zone_score(z, workload_kwh))
     state = _zone_to_state(best_zone, workload_kwh)
     return best_zone, state

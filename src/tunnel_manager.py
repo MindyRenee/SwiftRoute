@@ -1,9 +1,10 @@
 """Kernel-level WireGuard tunnel manager."""
 
+import asyncio
 import base64
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -26,6 +27,7 @@ class TunnelConfig:
     gateway_ip: str
     listen_port: int
     allowed_ips: str
+    config_file_path: Path | None = field(default=None, compare=False)
 
 
 class TunnelManagerError(Exception):
@@ -39,6 +41,7 @@ class WireGuardTunnelManager:
         self.config_path = Path(config_path)
         self._tunnels: dict[str, TunnelConfig] = {}
         self._ip_counter = 2
+        self._ip_lock = asyncio.Lock()
 
     @staticmethod
     def _generate_keypair() -> tuple[str, str]:
@@ -59,15 +62,16 @@ class WireGuardTunnelManager:
         ).decode()
         return priv_b64, pub_b64
 
-    def create_tunnel(self, node_ip: str | None = None) -> TunnelConfig:
+    async def create_tunnel(self, node_ip: str | None = None) -> TunnelConfig:
         """Generate a fresh WireGuard tunnel config with a unique node IP."""
         tunnel_id = str(uuid.uuid4())
         gw_priv, gw_pub = self._generate_keypair()
         node_priv, node_pub = self._generate_keypair()
 
         if node_ip is None:
-            ip = f"10.200.200.{self._ip_counter}/24"
-            self._ip_counter += 1
+            async with self._ip_lock:
+                ip = f"10.200.200.{self._ip_counter}/24"
+                self._ip_counter += 1
         else:
             ip = node_ip
 
@@ -86,8 +90,8 @@ class WireGuardTunnelManager:
         self._tunnels[tunnel_id] = cfg
         return cfg
 
-    def write_config(self, cfg: TunnelConfig, path: Path | None = None) -> Path:
-        """Persist a WireGuard configuration file."""
+    def write_config(self, cfg: TunnelConfig, path: Path | None = None) -> TunnelConfig:
+        """Persist a WireGuard configuration file and return updated config."""
         target = path or (self.config_path.parent / f"sap_{cfg.tunnel_id}.conf")
         target.parent.mkdir(parents=True, exist_ok=True)
         wg_conf = f"""[Interface]
@@ -102,12 +106,27 @@ Endpoint = {cfg.gateway_endpoint}
 PersistentKeepalive = 25
 """
         target.write_text(wg_conf)
-        return target
+        return TunnelConfig(
+            tunnel_id=cfg.tunnel_id,
+            gateway_private_key=cfg.gateway_private_key,
+            gateway_public_key=cfg.gateway_public_key,
+            node_private_key=cfg.node_private_key,
+            node_public_key=cfg.node_public_key,
+            gateway_endpoint=cfg.gateway_endpoint,
+            node_ip=cfg.node_ip,
+            gateway_ip=cfg.gateway_ip,
+            listen_port=cfg.listen_port,
+            allowed_ips=cfg.allowed_ips,
+            config_file_path=target,
+        )
 
-    def bring_up(self, cfg: TunnelConfig) -> None:
+    def bring_up(self, cfg: TunnelConfig) -> TunnelConfig:
         """Raise the WireGuard interface (requires root / CAP_NET_ADMIN)."""
         iface = f"sap_{cfg.tunnel_id[:8]}"
-        config_file = self.write_config(cfg)
+        updated_cfg = self.write_config(cfg)
+        config_file = updated_cfg.config_file_path
+        if config_file is None:
+            raise TunnelManagerError("Config file path not set after write")
         try:
             subprocess.run(
                 ["wg-quick", "up", str(config_file)],
@@ -119,10 +138,11 @@ PersistentKeepalive = 25
             raise TunnelManagerError("wg-quick not found; install WireGuard tools") from exc
         except subprocess.CalledProcessError as exc:
             raise TunnelManagerError(f"Failed to bring up {iface}: {exc.stderr}") from exc
+        return updated_cfg
 
     def tear_down(self, cfg: TunnelConfig) -> None:
         """Destroy the tunnel interface."""
-        config_file = self.config_path.parent / f"sap_{cfg.tunnel_id}.conf"
+        config_file = cfg.config_file_path or (self.config_path.parent / f"sap_{cfg.tunnel_id}.conf")
         try:
             subprocess.run(
                 ["wg-quick", "down", str(config_file)],
