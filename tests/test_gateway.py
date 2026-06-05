@@ -299,24 +299,21 @@ class TestStripeWebhook:
 
     def test_webhook_invalid_signature(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        settings.payment_mode = "stripe"
-        settings.stripe_webhook_secret = "whsec_test"
+        monkeypatch.setattr(settings, "payment_mode", "stripe")
+        monkeypatch.setattr(settings, "stripe_webhook_secret", "whsec_test")
 
         def fake_construct_event(*args: Any, **kwargs: Any) -> None:
             raise ValueError("Invalid signature")
 
-        monkeypatch.setattr("stripe.Webhook.construct_event", fake_construct_event)
+        monkeypatch.setattr("src.gateway._stripe_module.Webhook.construct_event", fake_construct_event)
         r = client.post("/webhook/stripe", data=b"{}", headers={"stripe-signature": "bad"})
         assert r.status_code == 400
         assert "verification failed" in r.json()["detail"]
 
-        settings.payment_mode = "mock"
-        settings.stripe_webhook_secret = ""
-
     def test_webhook_charge_succeeded(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        settings.payment_mode = "stripe"
-        settings.stripe_webhook_secret = "whsec_test"
+        monkeypatch.setattr(settings, "payment_mode", "stripe")
+        monkeypatch.setattr(settings, "stripe_webhook_secret", "whsec_test")
 
         def fake_construct_event(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -325,7 +322,7 @@ class TestStripeWebhook:
                 "data": {"object": {"id": "ch_123", "amount": 5000}},
             }
 
-        monkeypatch.setattr("stripe.Webhook.construct_event", fake_construct_event)
+        monkeypatch.setattr("src.gateway._stripe_module.Webhook.construct_event", fake_construct_event)
         r = client.post("/webhook/stripe", data=b"{}", headers={"stripe-signature": "sig"})
         assert r.status_code == 200
         data = r.json()
@@ -333,13 +330,10 @@ class TestStripeWebhook:
         assert data["charge_id"] == "ch_123"
         assert data["amount_usd"] == 50.0
 
-        settings.payment_mode = "mock"
-        settings.stripe_webhook_secret = ""
-
     def test_webhook_charge_failed(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        settings.payment_mode = "stripe"
-        settings.stripe_webhook_secret = "whsec_test"
+        monkeypatch.setattr(settings, "payment_mode", "stripe")
+        monkeypatch.setattr(settings, "stripe_webhook_secret", "whsec_test")
 
         def fake_construct_event(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -348,20 +342,17 @@ class TestStripeWebhook:
                 "data": {"object": {"id": "ch_456", "failure_message": "card_declined"}},
             }
 
-        monkeypatch.setattr("stripe.Webhook.construct_event", fake_construct_event)
+        monkeypatch.setattr("src.gateway._stripe_module.Webhook.construct_event", fake_construct_event)
         r = client.post("/webhook/stripe", data=b"{}", headers={"stripe-signature": "sig"})
         assert r.status_code == 200
         data = r.json()
         assert data["status"] == "charge_failed"
         assert data["reason"] == "card_declined"
 
-        settings.payment_mode = "mock"
-        settings.stripe_webhook_secret = ""
-
     def test_webhook_ignored_event(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        settings.payment_mode = "stripe"
-        settings.stripe_webhook_secret = "whsec_test"
+        monkeypatch.setattr(settings, "payment_mode", "stripe")
+        monkeypatch.setattr(settings, "stripe_webhook_secret", "whsec_test")
 
         def fake_construct_event(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -370,15 +361,12 @@ class TestStripeWebhook:
                 "data": {"object": {"id": "cus_789"}},
             }
 
-        monkeypatch.setattr("stripe.Webhook.construct_event", fake_construct_event)
+        monkeypatch.setattr("src.gateway._stripe_module.Webhook.construct_event", fake_construct_event)
         r = client.post("/webhook/stripe", data=b"{}", headers={"stripe-signature": "sig"})
         assert r.status_code == 200
         data = r.json()
         assert data["status"] == "ignored"
         assert data["event_type"] == "customer.created"
-
-        settings.payment_mode = "mock"
-        settings.stripe_webhook_secret = ""
 
 
 class TestStripeSetupWebhook:
@@ -389,14 +377,11 @@ class TestStripeSetupWebhook:
 
     def test_setup_missing_url(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        settings.payment_mode = "stripe"
-        settings.stripe_secret_key = "sk_test_123"
+        monkeypatch.setattr(settings, "payment_mode", "stripe")
+        monkeypatch.setattr(settings, "stripe_secret_key", "sk_test_123")
 
         r = client.post("/stripe/setup-webhook", json={})
         assert r.status_code == 422  # Pydantic validation error
-
-        settings.payment_mode = "mock"
-        settings.stripe_secret_key = ""
 
 
 class TestAiTxt:
@@ -426,8 +411,8 @@ class TestCheckoutCreate:
 
     def test_checkout_invalid_script(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         from src.config import settings
-        settings.payment_mode = "stripe"
-        settings.stripe_secret_key = "sk_test_123"
+        monkeypatch.setattr(settings, "payment_mode", "stripe")
+        monkeypatch.setattr(settings, "stripe_secret_key", "sk_test_123")
 
         r = client.post(
             "/checkout/create",
@@ -439,10 +424,7 @@ class TestCheckoutCreate:
             },
         )
         assert r.status_code == 400
-        assert "forbidden" in r.json()["detail"].lower()
-
-        settings.payment_mode = "mock"
-        settings.stripe_secret_key = ""
+        assert "validation failed" in r.json()["detail"].lower()
 
 
 class TestConnectPayout:
@@ -466,7 +448,7 @@ class TestConnectPayout:
         # Buy tickets first to generate creator balance
         script = base64.b64encode(b"print('hello')").decode()
         for _ in range(3):
-            client.post(
+            r = client.post(
                 "/ticket",
                 json={
                     "action": "buy_subgrid_compute_ticket",
@@ -474,6 +456,8 @@ class TestConnectPayout:
                     "max_budget_usd": 5.0,
                 },
             )
+            _poll_job_status(client, r.json()["job_id"])
+
         r = client.post(
             "/connect/payout",
             json={"stripe_account_id": "acct_test_123", "amount_usd": 0.05},

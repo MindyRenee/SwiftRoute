@@ -2,13 +2,16 @@
 
 from pathlib import Path
 
+import pytest
+
 from src.tunnel_manager import TunnelConfig, WireGuardTunnelManager
 
 
 class TestWireGuardTunnelManager:
-    def test_create_tunnel(self) -> None:
+    @pytest.mark.anyio
+    async def test_create_tunnel(self) -> None:
         mgr = WireGuardTunnelManager()
-        cfg = mgr.create_tunnel()
+        cfg = await mgr.create_tunnel()
         assert isinstance(cfg, TunnelConfig)
         assert cfg.tunnel_id
         assert cfg.gateway_private_key
@@ -18,19 +21,22 @@ class TestWireGuardTunnelManager:
         assert cfg.tunnel_id in mgr._tunnels
 
     def test_write_config(self, tmp_path: Path) -> None:
+        import asyncio
         mgr = WireGuardTunnelManager()
-        cfg = mgr.create_tunnel()
+        cfg = asyncio.run(mgr.create_tunnel())
         out_path = tmp_path / "wg.conf"
-        written = mgr.write_config(cfg, out_path)
-        assert written.exists()
-        text = written.read_text()
+        updated_cfg = mgr.write_config(cfg, out_path)
+        assert updated_cfg.config_file_path is not None
+        assert updated_cfg.config_file_path.exists()
+        text = updated_cfg.config_file_path.read_text()
         assert "[Interface]" in text
         assert cfg.node_private_key in text
         assert cfg.gateway_public_key in text
 
     def test_teardown_removes_tunnel(self, tmp_path: Path) -> None:
+        import asyncio
         mgr = WireGuardTunnelManager()
-        cfg = mgr.create_tunnel()
+        cfg = asyncio.run(mgr.create_tunnel())
         mgr.write_config(cfg, tmp_path / f"sap_{cfg.tunnel_id}.conf")
         mgr.tear_down(cfg)
         assert cfg.tunnel_id not in mgr._tunnels
@@ -42,10 +48,11 @@ class TestWireGuardTunnelManager:
         assert len(priv) > 20
         assert len(pub) > 20
 
-    def test_create_tunnel_auto_increments_ip(self) -> None:
+    @pytest.mark.anyio
+    async def test_create_tunnel_auto_increments_ip(self) -> None:
         mgr = WireGuardTunnelManager()
-        cfg1 = mgr.create_tunnel()
-        cfg2 = mgr.create_tunnel()
+        cfg1 = await mgr.create_tunnel()
+        cfg2 = await mgr.create_tunnel()
         assert cfg1.node_ip != cfg2.node_ip
         assert "10.200.200." in cfg1.node_ip
         assert "10.200.200." in cfg2.node_ip
